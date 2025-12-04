@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: raw
+    database: "{{ target.database }}"
+    schema: RAW
+    tables:
+      - name: IMDB_TITLE_BASICS
+      - name: IMDB_TITLE_RATINGS

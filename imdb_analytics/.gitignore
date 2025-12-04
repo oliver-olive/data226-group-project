@@ -1,0 +1,11 @@
+
+target/
+dbt_packages/
+logs/
+
+profiles.yml
+.user.yml
+
+
+airflow/logs/
+airflow/plugins/

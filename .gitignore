@@ -1,0 +1,32 @@
+# Credentials
+profiles.yml
+.user.yml
+*.env
+.env*
+
+# Python virtual environment
+env/
+venv/
+.venv/
+
+# dbt compiled + artifact directories
+imdb_analytics/target/
+imdb_analytics/logs/
+imdb_analytics/dbt_packages/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS junk
+.DS_Store
+
+# VSCode settings
+.vscode/
+
+# Airflow cache
+dags/__pycache__/
+
+logs/
+imdb_analytics/logs/
+
