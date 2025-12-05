@@ -292,7 +292,7 @@ def publish_results(data: dict):
 with DAG(
     dag_id="movie_genre_rating_ml",
     start_date=datetime(2025, 11, 20),
-    schedule_interval=None,
+    schedule_interval="0 4 * * *", 
     catchup=False,
     tags=["ML", "movie"],
 ) as dag:

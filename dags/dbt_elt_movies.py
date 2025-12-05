@@ -15,7 +15,7 @@ with DAG(
     default_args=default_args,
     description="Run dbt ELT models for IMDb project",
     start_date=datetime(2025, 1, 1),
-    schedule_interval=None,
+    schedule_interval="30 3 * * *", 
     catchup=False,
     tags=["dbt", "elt", "imdb"],
 ) as dag:

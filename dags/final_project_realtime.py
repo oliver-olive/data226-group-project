@@ -170,6 +170,144 @@ def etl_tmdb_now_playing():
     df_clean = transform_tmdb_now_playing(df_raw)
     load_tmdb_now_playing_to_snowflake(df_clean)
 
+@task
+def tmdb_upsert_imdb():
+    conn = get_snowflake_connection()
+    cur = conn.cursor()
+    basics_table = "IMDB_TITLE_BASICS"
+    ratings_table = "IMDB_TITLE_RATINGS"
+    tmdb_table = "TMDB_NOW_PLAYING"
+
+    try:
+        cur.execute("BEGIN;")
+        cur.execute(f"USE DATABASE {SNOWFLAKE_DB}")
+        cur.execute("USE SCHEMA RAW")
+
+        # Ensure IMDb tables exist (defensive)
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {basics_table} (
+                tconst STRING NOT NULL,
+                primaryTitle STRING,
+                originalTitle STRING,
+                startYear INTEGER,
+                runtimeMinutes INTEGER,
+                genres STRING
+            );
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {ratings_table} (
+                tconst STRING NOT NULL,
+                averageRating FLOAT,
+                numVotes INTEGER
+            );
+            """
+        )
+
+        # 1) MERGE into IMDB_TITLE_BASICS with de-duplication on tmdb_id
+        merge_basics_sql = f"""
+            MERGE INTO {basics_table} AS tgt
+            USING (
+                SELECT
+                    'tmdb_' || tmdb_id AS tconst,
+                    title            AS primaryTitle,
+                    original_title   AS originalTitle,
+                    EXTRACT(YEAR FROM release_date) AS startYear,
+                    NULL::INTEGER    AS runtimeMinutes,
+                    genre_ids        AS genres
+                FROM (
+                    SELECT
+                        tmdb_id,
+                        title,
+                        original_title,
+                        release_date,
+                        genre_ids,
+                        snapshot_date,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY tmdb_id
+                            ORDER BY snapshot_date DESC
+                        ) AS rn
+                    FROM {tmdb_table}
+                )
+                WHERE rn = 1
+            ) AS src
+            ON tgt.tconst = src.tconst
+            WHEN MATCHED THEN UPDATE SET
+                tgt.primaryTitle   = src.primaryTitle,
+                tgt.originalTitle  = src.originalTitle,
+                tgt.startYear      = src.startYear,
+                tgt.genres         = src.genres
+            WHEN NOT MATCHED THEN INSERT (
+                tconst,
+                primaryTitle,
+                originalTitle,
+                startYear,
+                runtimeMinutes,
+                genres
+            )
+            VALUES (
+                src.tconst,
+                src.primaryTitle,
+                src.originalTitle,
+                src.startYear,
+                src.runtimeMinutes,
+                src.genres
+            );
+        """
+        cur.execute(merge_basics_sql)
+
+        # 2) MERGE into IMDB_TITLE_RATINGS with de-duplication on tmdb_id
+        merge_ratings_sql = f"""
+            MERGE INTO {ratings_table} AS tgt
+            USING (
+                SELECT
+                    'tmdb_' || tmdb_id AS tconst,
+                    vote_average       AS averageRating,
+                    vote_count         AS numVotes
+                FROM (
+                    SELECT
+                        tmdb_id,
+                        vote_average,
+                        vote_count,
+                        snapshot_date,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY tmdb_id
+                            ORDER BY snapshot_date DESC
+                        ) AS rn
+                    FROM {tmdb_table}
+                )
+                WHERE rn = 1
+            ) AS src
+            ON tgt.tconst = src.tconst
+            WHEN MATCHED THEN UPDATE SET
+                tgt.averageRating = src.averageRating,
+                tgt.numVotes      = src.numVotes
+            WHEN NOT MATCHED THEN INSERT (
+                tconst,
+                averageRating,
+                numVotes
+            )
+            VALUES (
+                src.tconst,
+                src.averageRating,
+                src.numVotes
+            );
+        """
+        cur.execute(merge_ratings_sql)
+
+        cur.execute("COMMIT;")
+        print("TMDb → IMDb UPSERT committed.")
+    except Exception as e:
+        cur.execute("ROLLBACK;")
+        print("Error in TMDb → IMDb UPSERT:", e)
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 
 with DAG(
     dag_id="tmdb_now_playing_etl",
@@ -178,5 +316,5 @@ with DAG(
     catchup=False,
     tags=["ETL", "tmdb", "movie"],
 ) as dag:
-    etl_tmdb_now_playing()
+    etl_tmdb_now_playing() >> tmdb_upsert_imdb()
 
