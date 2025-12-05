@@ -160,7 +160,7 @@ def train_and_evaluate():
     # 3) APPLY MODEL to ALL movies from 2020 onward
     #    (rated & unrated, for visualization / forecasting)
     # =========================================================
-    apply_mask = df["startYear"] >= 2020
+    apply_mask = rated_mask & (df["startYear"] >= 2020)
     X_apply = X_all[apply_mask]
     y_pred_apply = model.predict(X_apply)
 
