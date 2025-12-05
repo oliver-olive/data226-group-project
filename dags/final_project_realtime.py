@@ -11,6 +11,25 @@ SNOWFLAKE_DB = Variable.get("SNOWFLAKE_DB")
 TMDB_BEARER_TOKEN = Variable.get("TMDB_BEARER_TOKEN")
 
 TMDB_NOW_PLAYING_URL = "https://api.themoviedb.org/3/movie/now_playing"
+TMDB_GENRE_LIST_URL = "https://api.themoviedb.org/3/genre/movie/list"
+
+def fetch_tmdb_genre_map() -> dict[int, str]:
+    """
+    Call TMDb /genre/movie/list and return a dict {genre_id: genre_name}.
+    """
+    headers = {
+        "Authorization": f"Bearer {TMDB_BEARER_TOKEN}",
+        "Content-Type": "application/json;charset=utf-8",
+    }
+    params = {"language": "en-US"}
+
+    resp = requests.get(TMDB_GENRE_LIST_URL, headers=headers, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    genres = data.get("genres", [])
+    # Example element: {"id": 28, "name": "Action"}
+    return {g["id"]: g["name"] for g in genres}
 
 
 def get_snowflake_connection():
@@ -65,21 +84,32 @@ def transform_tmdb_now_playing(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
+    # Get genre_id -> genre_name mapping from TMDb
+    genre_map = fetch_tmdb_genre_map()
+
     # release_date -> DATE
     df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce").dt.date
 
-    # convert genre_ids list to comma-separated string
-    def _genre_list_to_str(x):
+    # convert genre_ids list to comma-separated IDs
+    def _genre_list_to_ids(x):
         if isinstance(x, list):
             return ",".join(str(g) for g in x)
         return None
 
-    df["genre_ids_str"] = df["genre_ids"].apply(_genre_list_to_str)
+    # convert genre_ids list to comma-separated genre names
+    def _genre_list_to_names(x):
+        if isinstance(x, list):
+            names = [genre_map.get(g_id) for g_id in x if genre_map.get(g_id)]
+            return ",".join(names) if names else None
+        return None
+
+    df["genre_ids_str"] = df["genre_ids"].apply(_genre_list_to_ids)
+    df["genre_names"] = df["genre_ids"].apply(_genre_list_to_names)
 
     # numeric / types
-    df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce")
+    df["popularity"]   = pd.to_numeric(df["popularity"], errors="coerce")
     df["vote_average"] = pd.to_numeric(df["vote_average"], errors="coerce")
-    df["vote_count"] = pd.to_numeric(df["vote_count"], errors="coerce").astype("Int64")
+    df["vote_count"]   = pd.to_numeric(df["vote_count"], errors="coerce").astype("Int64")
 
     # snapshot_date = when we fetched this
     df["snapshot_date"] = datetime.utcnow().date()
@@ -96,16 +126,23 @@ def transform_tmdb_now_playing(df: pd.DataFrame) -> pd.DataFrame:
             "vote_average",
             "vote_count",
             "genre_ids_str",
+            "genre_names",
             "adult",
             "snapshot_date",
         ]
     ]
 
-    df.rename(columns={"id": "tmdb_id", "genre_ids_str": "genre_ids"}, inplace=True)
+    df.rename(
+        columns={
+            "id": "tmdb_id",
+            "genre_ids_str": "genre_ids",   # keep IDs as before
+        },
+        inplace=True,
+    )
+
     df.reset_index(drop=True, inplace=True)
     print(f"Transformed TMDb now_playing shape: {df.shape}")
     return df
-
 
 def load_tmdb_now_playing_to_snowflake(df: pd.DataFrame):
     """
@@ -134,11 +171,13 @@ def load_tmdb_now_playing_to_snowflake(df: pd.DataFrame):
                 vote_average FLOAT,
                 vote_count INTEGER,
                 genre_ids STRING,
+                genre_names STRING,
                 adult BOOLEAN,
                 snapshot_date DATE
             );
             """
         )
+
         # full refresh each run
         cur.execute(f"DELETE FROM {table_name};")
         print(f"Loading DataFrame into Snowflake table {table_name}...")
@@ -216,14 +255,14 @@ def tmdb_upsert_imdb():
                     original_title   AS originalTitle,
                     EXTRACT(YEAR FROM release_date) AS startYear,
                     NULL::INTEGER    AS runtimeMinutes,
-                    genre_ids        AS genres
+                    genre_names        AS genres
                 FROM (
                     SELECT
                         tmdb_id,
                         title,
                         original_title,
                         release_date,
-                        genre_ids,
+                        genre_names,
                         snapshot_date,
                         ROW_NUMBER() OVER (
                             PARTITION BY tmdb_id
