@@ -181,6 +181,7 @@ def etl_title_ratings():
 with DAG(
         dag_id="movie_etl",
         start_date=datetime(2025, 11, 20),
+        schedule_interval="0 1 * * *", 
         catchup=False,
         tags=["ETL", "movie"]
 ) as dag:
