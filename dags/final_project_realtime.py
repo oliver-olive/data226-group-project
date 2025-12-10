@@ -12,6 +12,19 @@ TMDB_BEARER_TOKEN = Variable.get("TMDB_BEARER_TOKEN")
 
 TMDB_NOW_PLAYING_URL = "https://api.themoviedb.org/3/movie/now_playing"
 TMDB_GENRE_LIST_URL = "https://api.themoviedb.org/3/genre/movie/list"
+TMDB_EXTERNAL_IDS_URL = "https://api.themoviedb.org/3/movie/{tmdb_id}/external_ids"
+
+def fetch_imdb_id_for_tmdb_id(tmdb_id: int, headers: dict) -> str | None:
+    try:
+        url = TMDB_EXTERNAL_IDS_URL.format(tmdb_id=tmdb_id)
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("imdb_id")  # e.g. "tt1234567"
+    except Exception as e:
+        print(f"Failed to fetch imdb_id for tmdb_id={tmdb_id}: {e}")
+        return None
+
 
 def fetch_tmdb_genre_map() -> dict[int, str]:
     """
@@ -76,27 +89,27 @@ def extract_tmdb_now_playing():
 
 
 def transform_tmdb_now_playing(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Select and clean columns for Snowflake.
-    """
     if df.empty:
         return df
 
     df = df.copy()
 
-    # Get genre_id -> genre_name mapping from TMDb
+    headers = {
+        "Authorization": f"Bearer {TMDB_BEARER_TOKEN}",
+        "Content-Type": "application/json;charset=utf-8",
+    }
+
+    # existing genre_map logic...
     genre_map = fetch_tmdb_genre_map()
 
-    # release_date -> DATE
+    # release_date, genres, numeric cols as before ...
     df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce").dt.date
 
-    # convert genre_ids list to comma-separated IDs
     def _genre_list_to_ids(x):
         if isinstance(x, list):
             return ",".join(str(g) for g in x)
         return None
 
-    # convert genre_ids list to comma-separated genre names
     def _genre_list_to_names(x):
         if isinstance(x, list):
             names = [genre_map.get(g_id) for g_id in x if genre_map.get(g_id)]
@@ -106,18 +119,21 @@ def transform_tmdb_now_playing(df: pd.DataFrame) -> pd.DataFrame:
     df["genre_ids_str"] = df["genre_ids"].apply(_genre_list_to_ids)
     df["genre_names"] = df["genre_ids"].apply(_genre_list_to_names)
 
-    # numeric / types
     df["popularity"]   = pd.to_numeric(df["popularity"], errors="coerce")
     df["vote_average"] = pd.to_numeric(df["vote_average"], errors="coerce")
     df["vote_count"]   = pd.to_numeric(df["vote_count"], errors="coerce").astype("Int64")
-
-    # snapshot_date = when we fetched this
     df["snapshot_date"] = datetime.utcnow().date()
 
-    # final columns
+    # NEW: fetch imdb_id per tmdb_id
+    imdb_ids = []
+    for tmdb_id in df["id"]:
+        imdb_ids.append(fetch_imdb_id_for_tmdb_id(tmdb_id, headers))
+    df["imdb_id"] = imdb_ids  # may be null if TMDb doesn't know
+
     df = df[
         [
             "id",
+            "imdb_id",
             "title",
             "original_title",
             "original_language",
@@ -135,14 +151,14 @@ def transform_tmdb_now_playing(df: pd.DataFrame) -> pd.DataFrame:
     df.rename(
         columns={
             "id": "tmdb_id",
-            "genre_ids_str": "genre_ids",   # keep IDs as before
+            "genre_ids_str": "genre_ids",
         },
         inplace=True,
     )
-
     df.reset_index(drop=True, inplace=True)
     print(f"Transformed TMDb now_playing shape: {df.shape}")
     return df
+
 
 def load_tmdb_now_playing_to_snowflake(df: pd.DataFrame):
     """
@@ -163,6 +179,7 @@ def load_tmdb_now_playing_to_snowflake(df: pd.DataFrame):
             f"""
             CREATE TABLE IF NOT EXISTS {table_name} (
                 tmdb_id INTEGER NOT NULL,
+                imdb_id STRING,
                 title STRING,
                 original_title STRING,
                 original_language STRING,
@@ -250,15 +267,16 @@ def tmdb_upsert_imdb():
             MERGE INTO {basics_table} AS tgt
             USING (
                 SELECT
-                    'tmdb_' || tmdb_id AS tconst,
-                    title            AS primaryTitle,
-                    original_title   AS originalTitle,
+                    imdb_id                  AS tconst,
+                    title                    AS primaryTitle,
+                    original_title           AS originalTitle,
                     EXTRACT(YEAR FROM release_date) AS startYear,
-                    NULL::INTEGER    AS runtimeMinutes,
-                    genre_names        AS genres
+                    NULL::INTEGER            AS runtimeMinutes,
+                    genre_names              AS genres
                 FROM (
                     SELECT
                         tmdb_id,
+                        imdb_id,
                         title,
                         original_title,
                         release_date,
@@ -271,6 +289,8 @@ def tmdb_upsert_imdb():
                     FROM {tmdb_table}
                 )
                 WHERE rn = 1
+                AND imdb_id IS NOT NULL
+                AND imdb_id LIKE 'tt%'
             ) AS src
             ON tgt.tconst = src.tconst
             WHEN MATCHED THEN UPDATE SET
@@ -296,18 +316,18 @@ def tmdb_upsert_imdb():
             );
         """
         cur.execute(merge_basics_sql)
-
         # 2) MERGE into IMDB_TITLE_RATINGS with de-duplication on tmdb_id
         merge_ratings_sql = f"""
             MERGE INTO {ratings_table} AS tgt
             USING (
                 SELECT
-                    'tmdb_' || tmdb_id AS tconst,
+                    imdb_id            AS tconst,
                     vote_average       AS averageRating,
                     vote_count         AS numVotes
                 FROM (
                     SELECT
                         tmdb_id,
+                        imdb_id,
                         vote_average,
                         vote_count,
                         snapshot_date,
@@ -318,6 +338,8 @@ def tmdb_upsert_imdb():
                     FROM {tmdb_table}
                 )
                 WHERE rn = 1
+                AND imdb_id IS NOT NULL
+                AND imdb_id LIKE 'tt%'
             ) AS src
             ON tgt.tconst = src.tconst
             WHEN MATCHED THEN UPDATE SET
